@@ -1,5 +1,5 @@
 """
-Admin Bot — Manages multiple child bots, admins, backups.
+Admin Bot — Manages child bots, admins, backups, and database switching.
 """
 
 import os
@@ -16,10 +16,11 @@ from telebot import types
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from shared import database as db
+from shared import active_db as db
+from shared import db_config
 from shared.keyboards import (
     admin_main_menu, cancel_keyboard, build_bot_list_inline,
-    confirm_delete_inline, admin_manage_inline,
+    confirm_delete_inline, admin_manage_inline, db_switch_inline,
 )
 from shared.utils import paginate, ts_to_human
 
@@ -33,46 +34,54 @@ ADMIN_TOKEN = os.environ.get("ADMIN_BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 if not ADMIN_TOKEN:
-    raise RuntimeError("ADMIN_BOT_TOKEN env var is required")
+    raise RuntimeError("ADMIN_BOT_TOKEN is required")
 if not OWNER_ID:
-    raise RuntimeError("OWNER_ID env var is required")
+    raise RuntimeError("OWNER_ID is required")
 
 bot = telebot.TeleBot(ADMIN_TOKEN, parse_mode="HTML")
 
-# In-memory process registry: bot_id -> Popen
 child_processes: dict[int, subprocess.Popen] = {}
-
-# Conversation states
 user_states: dict[int, dict] = {}
 
 
-def get_state(uid: int) -> dict:
-    return user_states.get(uid, {})
-
-
-def set_state(uid: int, **kwargs):
-    user_states[uid] = kwargs
-
-
-def clear_state(uid: int):
-    user_states.pop(uid, None)
+def gs(uid): return user_states.get(uid, {})
+def ss(uid, **kw): user_states[uid] = kw
+def cs(uid): user_states.pop(uid, None)
 
 
 def require_admin(func):
-    def wrapper(message, *args, **kwargs):
+    def wrapper(message, *a, **kw):
         if not db.is_admin(message.from_user.id):
             bot.reply_to(message, "⛔ Access denied.")
             return
-        return func(message, *args, **kwargs)
+        return func(message, *a, **kw)
+    return wrapper
+
+
+def require_owner(func):
+    def wrapper(message, *a, **kw):
+        if not db.is_owner(message.from_user.id):
+            bot.reply_to(message, "⛔ Owner only.")
+            return
+        return func(message, *a, **kw)
     return wrapper
 
 
 def require_admin_cb(func):
-    def wrapper(call, *args, **kwargs):
+    def wrapper(call, *a, **kw):
         if not db.is_admin(call.from_user.id):
             bot.answer_callback_query(call.id, "⛔ Access denied.")
             return
-        return func(call, *args, **kwargs)
+        return func(call, *a, **kw)
+    return wrapper
+
+
+def require_owner_cb(func):
+    def wrapper(call, *a, **kw):
+        if not db.is_owner(call.from_user.id):
+            bot.answer_callback_query(call.id, "⛔ Owner only.")
+            return
+        return func(call, *a, **kw)
     return wrapper
 
 
@@ -83,10 +92,11 @@ def cmd_start(message: types.Message):
     if not db.is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ You are not authorized.")
         return
-    clear_state(message.from_user.id)
+    cs(message.from_user.id)
     bot.send_message(
         message.chat.id,
-        f"👋 Welcome to <b>Admin Bot</b>, {message.from_user.first_name}!\n\nUse the menu below.",
+        f"👋 Welcome to <b>Admin Bot</b>, {message.from_user.first_name}!\n\n"
+        "Use the menu buttons below to manage your bots.",
         reply_markup=admin_main_menu(),
     )
 
@@ -96,64 +106,59 @@ def cmd_start(message: types.Message):
 @bot.message_handler(func=lambda m: m.text == "➕ Add Child Bot")
 @require_admin
 def menu_add_bot(message: types.Message):
-    set_state(message.from_user.id, action="add_bot")
+    ss(message.from_user.id, action="add_bot")
     bot.send_message(
         message.chat.id,
         "🤖 <b>Add a New Child Bot</b>\n\n"
-        "Send the bot token from @BotFather.\n\n"
+        "Send the bot token from @BotFather.\n"
         "Example: <code>123456789:AABBCCaabbcc...</code>",
         reply_markup=cancel_keyboard(),
     )
 
 
-@bot.message_handler(func=lambda m: get_state(m.from_user.id).get("action") == "add_bot")
+@bot.message_handler(func=lambda m: gs(m.from_user.id).get("action") == "add_bot")
 @require_admin
 def handle_add_bot_token(message: types.Message):
     uid = message.from_user.id
     if message.text == "❌ Cancel":
-        clear_state(uid)
+        cs(uid)
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=admin_main_menu())
         return
-
     token = message.text.strip()
     if ":" not in token or len(token.split(":")[0]) < 5:
-        bot.reply_to(message, "⚠️ Invalid token format. Try again.")
+        bot.reply_to(message, "⚠️ Invalid token format.")
         return
-
     try:
         import requests as req
-        resp = req.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-        data = resp.json()
+        r = req.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+        data = r.json()
         if not data.get("ok"):
-            bot.reply_to(message, f"❌ Invalid token: {data.get('description', 'Unknown error')}")
+            bot.reply_to(message, f"❌ {data.get('description', 'Invalid token')}")
             return
         info = data["result"]
-        bot_username = info["username"]
-        bot_name = info.get("first_name", bot_username)
+        uname = info["username"]
+        name = info.get("first_name", uname)
     except Exception as e:
-        bot.reply_to(message, f"❌ Error validating token: {e}")
+        bot.reply_to(message, f"❌ Error: {e}")
         return
 
-    if db.add_child_bot(token, bot_username, bot_name, uid):
-        child_db_path = db.get_child_db_path(bot_username)
-        db.init_child_db(child_db_path)
+    if db.add_child_bot(token, uname, name, uid):
+        cdb = db.get_child_db_path(uname)
+        db.init_child_db(cdb)
         bot_row = db.get_child_bot_by_token(token)
-        clear_state(uid)
+        cs(uid)
         bot.send_message(
             message.chat.id,
             f"✅ <b>Bot Added!</b>\n\n"
-            f"🤖 <b>Name:</b> {bot_name}\n"
-            f"🔗 <b>Username:</b> @{bot_username}\n"
-            f"🆔 <b>ID:</b> <code>{bot_row['id']}</code>\n\n"
+            f"🤖 Name: <b>{name}</b>\n"
+            f"🔗 Username: @{uname}\n"
+            f"🆔 ID: <code>{bot_row['id'] if bot_row else '?'}</code>\n\n"
             "Use <b>▶️ Stop/Run Bot</b> to start it.",
             reply_markup=admin_main_menu(),
         )
     else:
-        clear_state(uid)
-        bot.send_message(
-            message.chat.id, f"⚠️ Bot @{bot_username} is already added.",
-            reply_markup=admin_main_menu(),
-        )
+        bot.send_message(message.chat.id, f"⚠️ @{uname} is already added.", reply_markup=admin_main_menu())
+    cs(uid)
 
 
 # ─── Remove Child Bot ─────────────────────────────────────────────────────────
@@ -167,7 +172,7 @@ def menu_remove_bot(message: types.Message):
         return
     page_bots, total_pages = paginate(bots, 1)
     bot.send_message(
-        message.chat.id, "🗑 <b>Remove Child Bot</b>\n\nSelect the bot to remove:",
+        message.chat.id, "🗑 <b>Remove Child Bot</b>\n\nSelect bot:",
         reply_markup=build_bot_list_inline(page_bots, 1, total_pages, "remove_select"),
     )
 
@@ -176,14 +181,14 @@ def menu_remove_bot(message: types.Message):
 @require_admin_cb
 def cb_remove_select(call: types.CallbackQuery):
     bot_id = int(call.data.split(":")[1])
-    bot_row = db.get_child_bot(bot_id)
-    if not bot_row:
+    row = db.get_child_bot(bot_id)
+    if not row:
         bot.answer_callback_query(call.id, "Not found.")
         return
     bot.edit_message_text(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
-        text=f"⚠️ Delete <b>{bot_row['bot_name']}</b> (@{bot_row['bot_username']})?\n\n<b>This cannot be undone.</b>",
+        text=f"⚠️ Delete <b>{row['bot_name']}</b> (@{row['bot_username']})?\n<b>This cannot be undone.</b>",
         reply_markup=confirm_delete_inline(bot_id),
         parse_mode="HTML",
     )
@@ -193,8 +198,8 @@ def cb_remove_select(call: types.CallbackQuery):
 @require_admin_cb
 def cb_confirm_delete(call: types.CallbackQuery):
     bot_id = int(call.data.split(":")[1])
-    bot_row = db.get_child_bot(bot_id)
-    if not bot_row:
+    row = db.get_child_bot(bot_id)
+    if not row:
         bot.answer_callback_query(call.id, "Not found.")
         return
     _stop_child(bot_id)
@@ -202,18 +207,14 @@ def cb_confirm_delete(call: types.CallbackQuery):
     bot.edit_message_text(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
-        text=f"✅ Bot <b>{bot_row['bot_name']}</b> deleted.",
+        text=f"✅ <b>{row['bot_name']}</b> deleted.",
         parse_mode="HTML",
     )
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "cancel_delete")
 def cb_cancel_delete(call: types.CallbackQuery):
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text="❌ Cancelled.",
-    )
+    bot.edit_message_text(call.message.chat.id, call.message.message_id, text="❌ Cancelled.")
 
 
 # ─── List Child Bots ──────────────────────────────────────────────────────────
@@ -225,25 +226,24 @@ def menu_list_bots(message: types.Message):
     if not bots:
         bot.send_message(message.chat.id, "📭 No child bots.", reply_markup=admin_main_menu())
         return
-    _send_bot_list_page(message.chat.id, bots, 1)
+    _send_bot_list(message.chat.id, bots, 1)
 
 
-def _send_bot_list_page(chat_id: int, bots: list, page: int, msg_id: int = None):
+def _send_bot_list(chat_id, bots, page, msg_id=None):
     page_bots, total_pages = paginate(bots, page)
     lines = [f"📋 <b>Child Bots</b> — Page {page}/{total_pages} (Total: {len(bots)})\n"]
     for i, b in enumerate(page_bots, 1):
-        status = "🟢" if b["is_running"] else "🔴"
-        child_db = db.get_child_db_path(b["bot_username"])
+        icon = "🟢" if b["is_running"] else "🔴"
+        cdb = db.get_child_db_path(b["bot_username"])
         try:
-            counts = db.count_users(child_db)
-            users = counts["total"]
+            c = db.count_users(cdb)
+            users = c["total"]
         except Exception:
             users = 0
         lines.append(
-            f"{i}. {status} <b>{b['bot_name']}</b>\n"
+            f"{i}. {icon} <b>{b['bot_name']}</b>\n"
             f"   🔗 @{b['bot_username']}\n"
-            f"   👥 Users: {users}\n"
-            f"   📅 Added: {ts_to_human(b['added_at'])}\n"
+            f"   👥 Users: {users}  📅 {ts_to_human(b['added_at'])}\n"
         )
     text = "\n".join(lines)
     kb = types.InlineKeyboardMarkup(row_width=3)
@@ -265,8 +265,7 @@ def _send_bot_list_page(chat_id: int, bots: list, page: int, msg_id: int = None)
 @require_admin_cb
 def cb_list_page(call: types.CallbackQuery):
     page = int(call.data.split(":")[1])
-    bots = db.list_child_bots()
-    _send_bot_list_page(call.message.chat.id, bots, page, call.message.message_id)
+    _send_bot_list(call.message.chat.id, db.list_child_bots(), page, call.message.message_id)
 
 
 # ─── Stop/Run Child Bot ───────────────────────────────────────────────────────
@@ -289,54 +288,31 @@ def menu_toggle_bot(message: types.Message):
 @require_admin_cb
 def cb_toggle_select(call: types.CallbackQuery):
     bot_id = int(call.data.split(":")[1])
-    bot_row = db.get_child_bot(bot_id)
-    if not bot_row:
+    row = db.get_child_bot(bot_id)
+    if not row:
         bot.answer_callback_query(call.id, "Not found.")
         return
-    _do_toggle(call, bot_id, bot_row)
-
-
-def _do_toggle(call: types.CallbackQuery, bot_id: int, bot_row):
-    if bot_row["is_running"]:
+    if row["is_running"]:
         _stop_child(bot_id)
-        db.set_child_bot_running(bot_id, False)
         bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=f"⏹ <b>{bot_row['bot_name']}</b> stopped.",
-            parse_mode="HTML",
+            call.message.chat.id, call.message.message_id,
+            text=f"⏹ <b>{row['bot_name']}</b> stopped.", parse_mode="HTML",
         )
     else:
-        ok, err = _start_child(bot_id, bot_row)
-        if ok:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=f"▶️ <b>{bot_row['bot_name']}</b> is now running.",
-                parse_mode="HTML",
-            )
-        else:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=f"❌ Failed to start <b>{bot_row['bot_name']}</b>: {err}",
-                parse_mode="HTML",
-            )
+        ok, err = _start_child(bot_id, row)
+        text = f"▶️ <b>{row['bot_name']}</b> is now running." if ok else f"❌ Failed: {err}"
+        bot.edit_message_text(call.message.chat.id, call.message.message_id, text=text, parse_mode="HTML")
 
 
-def _start_child(bot_id: int, bot_row) -> tuple[bool, str]:
-    child_script = ROOT / "child_bot" / "main.py"
+def _start_child(bot_id: int, row) -> tuple[bool, str]:
+    script = ROOT / "child_bot" / "main.py"
     env = os.environ.copy()
-    env["CHILD_BOT_TOKEN"] = bot_row["bot_token"]
-    env["CHILD_BOT_USERNAME"] = bot_row["bot_username"]
+    env["CHILD_BOT_TOKEN"] = row["bot_token"]
+    env["CHILD_BOT_USERNAME"] = row["bot_username"]
     env["ADMIN_BOT_TOKEN"] = ADMIN_TOKEN
     env["ADMIN_BOT_OWNER_ID"] = str(OWNER_ID)
     try:
-        proc = subprocess.Popen(
-            [sys.executable, str(child_script)],
-            env=env,
-            cwd=str(ROOT),
-        )
+        proc = subprocess.Popen([sys.executable, str(script)], env=env, cwd=str(ROOT))
         child_processes[bot_id] = proc
         db.set_child_bot_running(bot_id, True)
         return True, ""
@@ -365,53 +341,51 @@ def _stop_child(bot_id: int):
 def menu_total_users(message: types.Message):
     bots = db.list_child_bots()
     if not bots:
-        bot.send_message(message.chat.id, "📭 No child bots added yet.", reply_markup=admin_main_menu())
+        bot.send_message(message.chat.id, "📭 No child bots.", reply_markup=admin_main_menu())
         return
-
     lines = ["📊 <b>Total Users Across All Bots</b>\n"]
-    grand_total = 0
-    grand_active = 0
-
+    grand_total = grand_active = 0
     for b in bots:
-        child_db = db.get_child_db_path(b["bot_username"])
+        cdb = db.get_child_db_path(b["bot_username"])
         try:
-            db.init_child_db(child_db)
-            counts = db.count_users(child_db)
+            db.init_child_db(cdb)
+            c = db.count_users(cdb)
         except Exception:
-            counts = {"total": 0, "active": 0, "inactive": 0, "blocked": 0}
-
-        status = "🟢" if b["is_running"] else "🔴"
+            c = {"total": 0, "active": 0, "inactive": 0, "blocked": 0}
+        icon = "🟢" if b["is_running"] else "🔴"
         lines.append(
-            f"{status} <b>{b['bot_name']}</b> (@{b['bot_username']})\n"
-            f"   👥 Total: {counts['total']} | ✅ Active: {counts['active']} "
-            f"| ⚪ Inactive: {counts['inactive']} | 🚫 Blocked: {counts['blocked']}\n"
+            f"{icon} <b>{b['bot_name']}</b> (@{b['bot_username']})\n"
+            f"   👥 {c['total']} total | ✅ {c['active']} active | "
+            f"⚪ {c['inactive']} inactive | 🚫 {c['blocked']} blocked\n"
         )
-        grand_total += counts["total"]
-        grand_active += counts["active"]
-
-    lines.append(f"\n📈 <b>Grand Total: {grand_total} users | Active: {grand_active}</b>")
+        grand_total += c["total"]
+        grand_active += c["active"]
+    lines.append(f"\n📈 <b>Grand Total: {grand_total} | Active: {grand_active}</b>")
     bot.send_message(message.chat.id, "\n".join(lines), reply_markup=admin_main_menu())
 
 
-# ─── Backup Database ──────────────────────────────────────────────────────────
+# ─── Backup ───────────────────────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == "💾 Backup Database")
 @require_admin
 def menu_backup(message: types.Message):
     data_dir = db.DATA_DIR
     db_files = list(data_dir.glob("*.db")) if data_dir.exists() else []
+    cfg_file = data_dir / "db_config.json"
 
-    if not db_files:
-        bot.send_message(message.chat.id, "⚠️ No database files found.", reply_markup=admin_main_menu())
+    if not db_files and not cfg_file.exists():
+        bot.send_message(message.chat.id, "⚠️ No data to backup.", reply_markup=admin_main_menu())
         return
 
-    import time
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    import time as _t
+    ts = _t.strftime("%Y%m%d_%H%M%S")
     zip_path = Path(tempfile.gettempdir()) / f"backup_{ts}.zip"
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for db_file in db_files:
-            zf.write(db_file, db_file.name)
+        for f in db_files:
+            zf.write(f, f.name)
+        if cfg_file.exists():
+            zf.write(cfg_file, "db_config.json")
 
     with open(zip_path, "rb") as f:
         bot.send_document(
@@ -419,104 +393,93 @@ def menu_backup(message: types.Message):
             caption=(
                 f"💾 <b>Full Database Backup</b>\n"
                 f"📅 {ts}\n"
-                f"📦 Files: {len(db_files)} database(s)\n\n"
-                "All users, settings, channels, and bot data are included.\n"
-                "Restore with the <b>♻️ Restore Database</b> button."
+                f"📦 {len(db_files)} database file(s) + config\n\n"
+                "Restore with <b>♻️ Restore Database</b>."
             ),
             visible_file_name=f"backup_{ts}.zip",
         )
     zip_path.unlink(missing_ok=True)
 
 
-# ─── Restore Database ─────────────────────────────────────────────────────────
+# ─── Restore ──────────────────────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == "♻️ Restore Database")
 @require_admin
 def menu_restore(message: types.Message):
-    set_state(message.from_user.id, action="restore_db")
+    ss(message.from_user.id, action="restore_db")
     bot.send_message(
         message.chat.id,
         "♻️ <b>Restore Database</b>\n\n"
         "Send or forward the backup ZIP file.\n\n"
-        "⚠️ All currently running bots will be stopped, data restored, then <b>automatically restarted</b>.",
+        "⚠️ All running bots will stop, data restored, then <b>auto-restarted</b>.",
         reply_markup=cancel_keyboard(),
     )
 
 
 @bot.message_handler(
     content_types=["document"],
-    func=lambda m: get_state(m.from_user.id).get("action") == "restore_db",
+    func=lambda m: gs(m.from_user.id).get("action") == "restore_db",
 )
 @require_admin
 def handle_restore_file(message: types.Message):
     uid = message.from_user.id
     doc = message.document
     if not doc.file_name.endswith(".zip"):
-        bot.reply_to(message, "⚠️ Please send a .zip backup file.")
+        bot.reply_to(message, "⚠️ Send a .zip backup file.")
         return
 
-    status_msg = bot.send_message(message.chat.id, "⏳ Restoring database...")
+    status_msg = bot.send_message(message.chat.id, "⏳ Stopping bots and restoring...")
 
-    # Step 1: Stop all running bots
-    running_bots = [b for b in db.list_child_bots() if b["is_running"]]
-    for b in running_bots:
-        _stop_child(b["id"])
+    # Stop all bots
+    for b in db.list_child_bots():
+        if b["is_running"]:
+            _stop_child(b["id"])
 
-    # Step 2: Extract zip
-    file_info = bot.get_file(doc.file_id)
-    downloaded = bot.download_file(file_info.file_path)
-    tmp_zip = Path(tempfile.gettempdir()) / doc.file_name
-    tmp_zip.write_bytes(downloaded)
-
+    # Download and extract
+    raw = bot.download_file(bot.get_file(doc.file_id).file_path)
+    tmp = Path(tempfile.gettempdir()) / doc.file_name
+    tmp.write_bytes(raw)
     data_dir = db.DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with zipfile.ZipFile(tmp_zip, "r") as zf:
+        with zipfile.ZipFile(tmp, "r") as zf:
             names = zf.namelist()
             zf.extractall(data_dir)
-        tmp_zip.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
     except Exception as e:
-        bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=status_msg.message_id,
-            text=f"❌ Restore failed: {e}",
-        )
-        clear_state(uid)
+        bot.edit_message_text(message.chat.id, status_msg.message_id, text=f"❌ Failed: {e}")
+        cs(uid)
         return
 
-    # Step 3: Re-initialize admin DB
+    # Re-init DBs
     db.init_admin_db()
     if not db.is_admin(OWNER_ID):
         db.add_admin(OWNER_ID, None, "Owner", is_owner_flag=True)
 
-    # Step 4: Re-initialize all child DBs
     restored_bots = db.list_child_bots()
     for b in restored_bots:
-        child_db_path = db.get_child_db_path(b["bot_username"])
         try:
-            db.init_child_db(child_db_path)
+            db.init_child_db(db.get_child_db_path(b["bot_username"]))
         except Exception:
             pass
 
-    # Step 5: Auto-restart all bots that were previously marked running
-    restarted = []
+    # Auto-restart all bots
     db.set_all_bots_stopped()
+    restarted = []
     for b in restored_bots:
-        ok, err = _start_child(b["id"], b)
+        ok, _ = _start_child(b["id"], b)
         if ok:
             restarted.append(f"▶️ @{b['bot_username']}")
 
-    clear_state(uid)
-    restarted_text = "\n".join(restarted) if restarted else "None"
+    cs(uid)
     bot.edit_message_text(
         chat_id=message.chat.id,
         message_id=status_msg.message_id,
         text=(
-            f"✅ <b>Database Restored!</b>\n\n"
-            f"📦 Files restored: {', '.join(names)}\n\n"
-            f"🤖 <b>Auto-restarted bots:</b>\n{restarted_text}\n\n"
-            "All settings, users, and channels are back."
+            f"✅ <b>Restored!</b>\n\n"
+            f"📦 Files: {', '.join(names)}\n\n"
+            f"🤖 Auto-restarted:\n" + ("\n".join(restarted) if restarted else "None")
         ),
         parse_mode="HTML",
     )
@@ -543,18 +506,17 @@ def menu_use_child_admin(message: types.Message):
 @require_admin_cb
 def cb_open_child_admin(call: types.CallbackQuery):
     bot_id = int(call.data.split(":")[1])
-    bot_row = db.get_child_bot(bot_id)
-    if not bot_row:
+    row = db.get_child_bot(bot_id)
+    if not row:
         bot.answer_callback_query(call.id, "Not found.")
         return
-    link = f"https://t.me/{bot_row['bot_username']}?start=adminpanel"
+    link = f"https://t.me/{row['bot_username']}?start=adminpanel"
     bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
+        call.message.chat.id, call.message.message_id,
         text=(
-            f"🎛 <b>{bot_row['bot_name']}</b> Admin Panel\n\n"
-            f"👉 <a href='{link}'>Open @{bot_row['bot_username']}</a>\n\n"
-            "Your ID is pre-authorized as admin in this bot."
+            f"🎛 <b>{row['bot_name']}</b> Admin Panel\n\n"
+            f"👉 <a href='{link}'>Open @{row['bot_username']}</a>\n\n"
+            "Your ID is pre-authorized as admin."
         ),
         parse_mode="HTML",
     )
@@ -563,96 +525,260 @@ def cb_open_child_admin(call: types.CallbackQuery):
 # ─── Add/Remove Admin ─────────────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == "👥 Add/Remove Admin")
-@require_admin
+@require_owner
 def menu_manage_admins(message: types.Message):
-    if not db.is_owner(message.from_user.id):
-        bot.send_message(message.chat.id, "⛔ Only the owner can manage admins.", reply_markup=admin_main_menu())
-        return
     admins = db.list_admins()
     lines = ["👥 <b>Current Admins:</b>\n"]
     for a in admins:
         role = "👑 Owner" if a["is_owner"] else "🛡 Admin"
         uname = f"@{a['username']}" if a["username"] else "No username"
         lines.append(f"• {role} — {a['full_name']} ({uname}) [<code>{a['user_id']}</code>]")
-    bot.send_message(
-        message.chat.id, "\n".join(lines),
-        reply_markup=admin_manage_inline(admins),
-    )
+    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=admin_manage_inline(admins))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "add_admin_prompt")
-@require_admin_cb
+@require_owner_cb
 def cb_add_admin_prompt(call: types.CallbackQuery):
-    if not db.is_owner(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ Only the owner.")
-        return
-    set_state(call.from_user.id, action="add_admin")
+    ss(call.from_user.id, action="add_admin")
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        "➕ Send the <b>User ID</b> of the new admin:",
-        reply_markup=cancel_keyboard(),
-    )
+    bot.send_message(call.message.chat.id, "➕ Send the <b>User ID</b> of the new admin:", reply_markup=cancel_keyboard())
 
 
-@bot.message_handler(func=lambda m: get_state(m.from_user.id).get("action") == "add_admin")
-@require_admin
+@bot.message_handler(func=lambda m: gs(m.from_user.id).get("action") == "add_admin")
+@require_owner
 def handle_add_admin(message: types.Message):
     uid = message.from_user.id
     if message.text == "❌ Cancel":
-        clear_state(uid)
+        cs(uid)
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=admin_main_menu())
         return
     try:
         new_id = int(message.text.strip())
     except ValueError:
-        bot.reply_to(message, "⚠️ Send a numeric User ID.")
+        bot.reply_to(message, "⚠️ Send a numeric ID.")
         return
     if db.is_admin(new_id):
         bot.send_message(message.chat.id, "ℹ️ Already an admin.", reply_markup=admin_main_menu())
     else:
         db.add_admin(new_id, None, f"Admin {new_id}")
-        bot.send_message(
-            message.chat.id,
-            f"✅ User <code>{new_id}</code> added as admin.",
-            reply_markup=admin_main_menu(),
-        )
-    clear_state(uid)
+        bot.send_message(message.chat.id, f"✅ <code>{new_id}</code> added as admin.", reply_markup=admin_main_menu())
+    cs(uid)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("remove_admin:"))
-@require_admin_cb
+@require_owner_cb
 def cb_remove_admin(call: types.CallbackQuery):
-    if not db.is_owner(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ Only the owner.")
-        return
-    target_id = int(call.data.split(":")[1])
-    if db.remove_admin(target_id):
+    target = int(call.data.split(":")[1])
+    if db.remove_admin(target):
         bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=f"✅ Admin <code>{target_id}</code> removed.",
-            parse_mode="HTML",
+            call.message.chat.id, call.message.message_id,
+            text=f"✅ Admin <code>{target}</code> removed.", parse_mode="HTML",
         )
     else:
         bot.answer_callback_query(call.id, "Cannot remove owner or not found.")
 
 
-# ─── Pagination ───────────────────────────────────────────────────────────────
+# ─── 🗄 Switch Database ────────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "🗄 Switch Database")
+@require_owner
+def menu_switch_db(message: types.Message):
+    info = db_config.get_status_info()
+    db_type = info["type"]
+    icon = "🍃 MongoDB" if db_type == "mongodb" else "🗃 SQLite (Local)"
+    uri_display = ""
+    if db_type == "mongodb" and info["mongo_uri"]:
+        masked = info["mongo_uri"]
+        # Mask password in URI for display
+        if "@" in masked:
+            parts = masked.split("@")
+            prefix = parts[0]
+            if ":" in prefix.split("//")[-1]:
+                auth = prefix.split("//")[-1]
+                user = auth.split(":")[0]
+                masked = prefix.split("//")[0] + "//" + user + ":****@" + "@".join(parts[1:])
+        uri_display = f"\n🔗 URI: <code>{masked[:60]}...</code>"
+
+    bot.send_message(
+        message.chat.id,
+        f"🗄 <b>Database Settings</b>\n\n"
+        f"📊 Current: <b>{icon}</b>{uri_display}\n\n"
+        "Choose an action below:",
+        reply_markup=db_switch_inline(db_type),
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "switch_to_mongodb")
+@require_owner_cb
+def cb_switch_to_mongodb(call: types.CallbackQuery):
+    ss(call.from_user.id, action="enter_mongo_uri")
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "🍃 <b>Switch to MongoDB</b>\n\n"
+        "Send your MongoDB connection URI.\n\n"
+        "Free MongoDB at: <a href='https://www.mongodb.com/cloud/atlas'>MongoDB Atlas</a>\n\n"
+        "Format:\n"
+        "<code>mongodb+srv://username:password@cluster.mongodb.net/dbname</code>\n\n"
+        "Or local:\n"
+        "<code>mongodb://localhost:27017/botmanager</code>",
+        reply_markup=cancel_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+@bot.message_handler(func=lambda m: gs(m.from_user.id).get("action") == "enter_mongo_uri")
+@require_owner
+def handle_mongo_uri(message: types.Message):
+    uid = message.from_user.id
+    if message.text == "❌ Cancel":
+        cs(uid)
+        bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=admin_main_menu())
+        return
+
+    uri = message.text.strip()
+    if not uri.startswith("mongodb"):
+        bot.reply_to(message, "⚠️ Invalid URI. Must start with <code>mongodb://</code> or <code>mongodb+srv://</code>")
+        return
+
+    # Test connection
+    status_msg = bot.send_message(message.chat.id, "⏳ Testing MongoDB connection...")
+    try:
+        from shared.mongo_db import test_connection
+        ok, err = test_connection(uri)
+    except Exception as e:
+        ok, err = False, str(e)
+
+    if not ok:
+        bot.edit_message_text(
+            message.chat.id, status_msg.message_id,
+            text=f"❌ <b>Connection failed:</b>\n<code>{err}</code>\n\nCheck your URI and try again.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Save config and switch
+    db_config.switch_to_mongodb(uri)
+    cs(uid)
+    bot.edit_message_text(
+        message.chat.id, status_msg.message_id,
+        text=(
+            "✅ <b>MongoDB connected successfully!</b>\n\n"
+            "Config saved. <b>Restart the admin bot</b> for full effect.\n\n"
+            "💡 Use <b>🔁 Migrate data now</b> in the Switch Database menu to copy your existing data to MongoDB."
+        ),
+        parse_mode="HTML",
+    )
+    bot.send_message(message.chat.id, "Database switched.", reply_markup=admin_main_menu())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "switch_to_sqlite")
+@require_owner_cb
+def cb_switch_to_sqlite(call: types.CallbackQuery):
+    db_config.switch_to_sqlite()
+    bot.edit_message_text(
+        call.message.chat.id, call.message.message_id,
+        text=(
+            "✅ <b>Switched to SQLite (local).</b>\n\n"
+            "Restart the admin bot to apply the change.\n"
+            "Your local database files are preserved."
+        ),
+        parse_mode="HTML",
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "migrate_data")
+@require_owner_cb
+def cb_migrate_data(call: types.CallbackQuery):
+    current_type = db_config.get_db_type()
+    if current_type != "mongodb":
+        bot.answer_callback_query(call.id, "⚠️ Switch to MongoDB first, then migrate.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "⏳ Migrating...")
+    status_msg = bot.send_message(call.message.chat.id, "⏳ <b>Migrating SQLite → MongoDB...</b>")
+    try:
+        from shared.mongo_db import migrate_from_sqlite
+        counts = migrate_from_sqlite()
+        summary = "\n".join(f"• {k}: {v}" for k, v in counts.items())
+        bot.edit_message_text(
+            call.message.chat.id, status_msg.message_id,
+            text=f"✅ <b>Migration Complete!</b>\n\n{summary}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        bot.edit_message_text(
+            call.message.chat.id, status_msg.message_id,
+            text=f"❌ Migration error: {e}", parse_mode="HTML",
+        )
+
+
+# ─── 📡 Server Status ─────────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "📡 Server Status")
+@require_admin
+def menu_server_status(message: types.Message):
+    info = db_config.get_status_info()
+    db_type = info["type"]
+    lines = ["📡 <b>Server & Database Status</b>\n"]
+
+    # DB status
+    if db_type == "sqlite":
+        data_dir = db.DATA_DIR
+        db_files = list(data_dir.glob("*.db")) if data_dir.exists() else []
+        total_size = sum(f.stat().st_size for f in db_files) / 1024
+        lines.append(f"🗃 <b>Database:</b> SQLite (Local)")
+        lines.append(f"📁 Location: <code>{data_dir}</code>")
+        lines.append(f"📦 Files: {len(db_files)} ({total_size:.1f} KB)")
+        lines.append(f"✅ Status: Running")
+    else:
+        uri = info["mongo_uri"]
+        lines.append(f"🍃 <b>Database:</b> MongoDB (Cloud)")
+        try:
+            from shared.mongo_db import test_connection
+            ok, err = test_connection(uri)
+            if ok:
+                lines.append(f"✅ Status: Connected")
+            else:
+                lines.append(f"❌ Status: Error — {err[:80]}")
+        except Exception as e:
+            lines.append(f"❌ Status: {e}")
+
+    lines.append("")
+
+    # Child bot status
+    bots = db.list_child_bots()
+    running = sum(1 for b in bots if b["is_running"])
+    stopped = len(bots) - running
+
+    lines.append(f"🤖 <b>Child Bots:</b> {len(bots)} total")
+    lines.append(f"   🟢 Running: {running}  |  🔴 Stopped: {stopped}")
+    if bots:
+        for b in bots:
+            icon = "🟢" if b["is_running"] else "🔴"
+            lines.append(f"   {icon} @{b['bot_username']}")
+
+    lines.append("")
+
+    # Process check
+    alive = [bid for bid, proc in child_processes.items() if proc.poll() is None]
+    lines.append(f"⚙️ <b>Active processes:</b> {len(alive)}")
+
+    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=admin_main_menu())
+
+
+# ─── Generic pagination ───────────────────────────────────────────────────────
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("page:"))
 @require_admin_cb
 def cb_generic_page(call: types.CallbackQuery):
     parts = call.data.split(":")
-    action = parts[1]
-    page = int(parts[2])
+    action, page = parts[1], int(parts[2])
     bots = db.list_child_bots()
     page_bots, total_pages = paginate(bots, page)
-    kb = build_bot_list_inline(page_bots, page, total_pages, action)
     bot.edit_message_reply_markup(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=kb,
+        call.message.chat.id, call.message.message_id,
+        reply_markup=build_bot_list_inline(page_bots, page, total_pages, action),
     )
 
 
@@ -664,7 +790,7 @@ def cb_noop(call): bot.answer_callback_query(call.id)
 
 @bot.message_handler(func=lambda m: m.text == "❌ Cancel")
 def handle_cancel(message: types.Message):
-    clear_state(message.from_user.id)
+    cs(message.from_user.id)
     if db.is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=admin_main_menu())
     else:
@@ -677,18 +803,13 @@ def startup():
     db.init_admin_db()
     if not db.is_admin(OWNER_ID):
         db.add_admin(OWNER_ID, None, "Owner", is_owner_flag=True)
-
-    # Auto-start bots that were running before last shutdown
-    bots = db.list_child_bots()
-    db.set_all_bots_stopped()  # reset all flags first
-    for b in bots:
-        # Initialize child DB if missing
-        child_db_path = db.get_child_db_path(b["bot_username"])
+    db.set_all_bots_stopped()
+    for b in db.list_child_bots():
         try:
-            db.init_child_db(child_db_path)
+            db.init_child_db(db.get_child_db_path(b["bot_username"]))
         except Exception:
             pass
-    logger.info("Admin Bot ready. Owner: %s", OWNER_ID)
+    logger.info("Admin Bot ready. DB: %s | Owner: %s", db_config.get_db_type(), OWNER_ID)
 
 
 def main():
