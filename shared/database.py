@@ -268,6 +268,14 @@ def get_active_users(db_path: Path) -> list:
         ).fetchall()
 
 
+def get_non_blocked_users(db_path: Path) -> list:
+    """Return all users who are not blocked (includes inactive). For broad broadcasts."""
+    with get_conn(db_path) as conn:
+        return conn.execute(
+            "SELECT user_id FROM bot_users WHERE is_blocked=0"
+        ).fetchall()
+
+
 def get_all_users_paginated(db_path: Path, page: int = 1, per_page: int = 10) -> tuple:
     offset = (page - 1) * per_page
     with get_conn(db_path) as conn:
