@@ -1,13 +1,16 @@
 """
-Admin Bot — Manages child bots, admins, backups, and database switching.
+Admin Bot — Manages child bots, admins, backups, database switching, CSV export.
 """
 
+import csv
+import io
 import os
 import sys
 import logging
 import subprocess
 import zipfile
 import tempfile
+import datetime
 from pathlib import Path
 
 import telebot
@@ -83,6 +86,16 @@ def require_owner_cb(func):
             return
         return func(call, *a, **kw)
     return wrapper
+
+
+def _safe_count(bot_username: str) -> dict:
+    """Safely get user counts for a child bot — init DB if needed."""
+    cdb = db.get_child_db_path(bot_username)
+    try:
+        db.init_child_db(cdb)
+        return db.count_users(cdb)
+    except Exception:
+        return {"total": 0, "active": 0, "inactive": 0, "blocked": 0}
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
@@ -234,16 +247,13 @@ def _send_bot_list(chat_id, bots, page, msg_id=None):
     lines = [f"📋 <b>Child Bots</b> — Page {page}/{total_pages} (Total: {len(bots)})\n"]
     for i, b in enumerate(page_bots, 1):
         icon = "🟢" if b["is_running"] else "🔴"
-        cdb = db.get_child_db_path(b["bot_username"])
-        try:
-            c = db.count_users(cdb)
-            users = c["total"]
-        except Exception:
-            users = 0
+        # Always init child DB before reading user counts to get live data
+        c = _safe_count(b["bot_username"])
         lines.append(
-            f"{i}. {icon} <b>{b['bot_name']}</b>\n"
-            f"   🔗 @{b['bot_username']}\n"
-            f"   👥 Users: {users}  📅 {ts_to_human(b['added_at'])}\n"
+            f"{i}. {icon} <b>{b['bot_name']}</b> (@{b['bot_username']})\n"
+            f"   👥 Total: {c['total']} | ✅ Active: {c['active']}"
+            f" | ⚪ Inactive: {c['inactive']} | 🚫 Blocked: {c['blocked']}\n"
+            f"   📅 Added: {ts_to_human(b['added_at'])}\n"
         )
     text = "\n".join(lines)
     kb = types.InlineKeyboardMarkup(row_width=3)
@@ -343,25 +353,117 @@ def menu_total_users(message: types.Message):
     if not bots:
         bot.send_message(message.chat.id, "📭 No child bots.", reply_markup=admin_main_menu())
         return
-    lines = ["📊 <b>Total Users Across All Bots</b>\n"]
-    grand_total = grand_active = 0
+    lines = ["📊 <b>User Statistics — All Child Bots</b>\n"]
+    grand_total = grand_active = grand_inactive = grand_blocked = 0
+    for b in bots:
+        c = _safe_count(b["bot_username"])
+        icon = "🟢" if b["is_running"] else "🔴"
+        lines.append(
+            f"{icon} <b>{b['bot_name']}</b> (@{b['bot_username']})\n"
+            f"   👥 Total: <b>{c['total']}</b> | ✅ Active: {c['active']}"
+            f" | ⚪ Inactive: {c['inactive']} | 🚫 Blocked: {c['blocked']}\n"
+        )
+        grand_total += c["total"]
+        grand_active += c["active"]
+        grand_inactive += c["inactive"]
+        grand_blocked += c["blocked"]
+    lines.append(
+        "─────────────────\n"
+        f"📈 <b>Grand Total: {grand_total}</b>\n"
+        f"   ✅ Active: {grand_active} | ⚪ Inactive: {grand_inactive} | 🚫 Blocked: {grand_blocked}"
+    )
+    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=admin_main_menu())
+
+
+# ─── 📥 Download Users CSV ────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "📥 Download Users CSV")
+@require_admin
+def menu_download_csv(message: types.Message):
+    bots = db.list_child_bots()
+    if not bots:
+        bot.send_message(message.chat.id, "📭 No child bots to export.", reply_markup=admin_main_menu())
+        return
+
+    status_msg = bot.send_message(message.chat.id, "⏳ Generating CSV file...")
+
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    writer.writerow([f"Bot Data Export — Generated: {now_str}"])
+    writer.writerow([])
+
+    summary_rows = []
+    grand_total = 0
+
+    def ts_fmt(ts) -> str:
+        if not ts:
+            return ""
+        try:
+            return datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts)
+
     for b in bots:
         cdb = db.get_child_db_path(b["bot_username"])
         try:
             db.init_child_db(cdb)
-            c = db.count_users(cdb)
+            users = db.get_all_users_export(cdb)
+            count = len(users)
         except Exception:
-            c = {"total": 0, "active": 0, "inactive": 0, "blocked": 0}
-        icon = "🟢" if b["is_running"] else "🔴"
-        lines.append(
-            f"{icon} <b>{b['bot_name']}</b> (@{b['bot_username']})\n"
-            f"   👥 {c['total']} total | ✅ {c['active']} active | "
-            f"⚪ {c['inactive']} inactive | 🚫 {c['blocked']} blocked\n"
-        )
-        grand_total += c["total"]
-        grand_active += c["active"]
-    lines.append(f"\n📈 <b>Grand Total: {grand_total} | Active: {grand_active}</b>")
-    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=admin_main_menu())
+            users = []
+            count = 0
+
+        writer.writerow([f"=== Bot: {b['bot_name']} (@{b['bot_username']}) ==="])
+        writer.writerow([f"Total Users: {count}"])
+        writer.writerow([
+            "User ID", "Username", "Full Name",
+            "Status", "Blocked", "Joined Date", "Last Seen",
+        ])
+
+        for u in users:
+            status = "Active" if u["is_active"] and not u["is_blocked"] else (
+                "Blocked" if u["is_blocked"] else "Inactive"
+            )
+            writer.writerow([
+                u["user_id"],
+                u["username"] or "",
+                u["full_name"],
+                status,
+                "Yes" if u["is_blocked"] else "No",
+                ts_fmt(u["joined_at"]),
+                ts_fmt(u["last_seen"]),
+            ])
+
+        writer.writerow([])  # blank separator
+        summary_rows.append((b["bot_name"], b["bot_username"], count))
+        grand_total += count
+
+    # Summary section at the end
+    writer.writerow(["=== SUMMARY ==="])
+    writer.writerow(["Bot Name", "Bot Username", "Total Users"])
+    for bname, buname, cnt in summary_rows:
+        writer.writerow([bname, f"@{buname}", cnt])
+    writer.writerow(["GRAND TOTAL", "", grand_total])
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")  # utf-8-sig for Excel compatibility
+    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"bot_users_{ts_file}.csv"
+
+    bot.delete_message(message.chat.id, status_msg.message_id)
+    bot.send_document(
+        message.chat.id,
+        (filename, io.BytesIO(csv_bytes)),
+        caption=(
+            f"📥 <b>User Data Export</b>\n"
+            f"📅 {now_str}\n"
+            f"🤖 Bots: {len(bots)}\n"
+            f"👥 Grand Total: <b>{grand_total}</b> users\n\n"
+            "Open with Excel or Google Sheets."
+        ),
+        visible_file_name=filename,
+    )
 
 
 # ─── Backup ───────────────────────────────────────────────────────────────────
@@ -430,12 +532,10 @@ def handle_restore_file(message: types.Message):
 
     status_msg = bot.send_message(message.chat.id, "⏳ Stopping bots and restoring...")
 
-    # Stop all bots
     for b in db.list_child_bots():
         if b["is_running"]:
             _stop_child(b["id"])
 
-    # Download and extract
     raw = bot.download_file(bot.get_file(doc.file_id).file_path)
     tmp = Path(tempfile.gettempdir()) / doc.file_name
     tmp.write_bytes(raw)
@@ -452,7 +552,6 @@ def handle_restore_file(message: types.Message):
         cs(uid)
         return
 
-    # Re-init DBs
     db.init_admin_db()
     if not db.is_admin(OWNER_ID):
         db.add_admin(OWNER_ID, None, "Owner", is_owner_flag=True)
@@ -464,7 +563,6 @@ def handle_restore_file(message: types.Message):
         except Exception:
             pass
 
-    # Auto-restart all bots
     db.set_all_bots_stopped()
     restarted = []
     for b in restored_bots:
@@ -589,7 +687,6 @@ def menu_switch_db(message: types.Message):
     uri_display = ""
     if db_type == "mongodb" and info["mongo_uri"]:
         masked = info["mongo_uri"]
-        # Mask password in URI for display
         if "@" in masked:
             parts = masked.split("@")
             prefix = parts[0]
@@ -635,20 +732,16 @@ def handle_mongo_uri(message: types.Message):
         cs(uid)
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=admin_main_menu())
         return
-
     uri = message.text.strip()
     if not uri.startswith("mongodb"):
         bot.reply_to(message, "⚠️ Invalid URI. Must start with <code>mongodb://</code> or <code>mongodb+srv://</code>")
         return
-
-    # Test connection
     status_msg = bot.send_message(message.chat.id, "⏳ Testing MongoDB connection...")
     try:
         from shared.mongo_db import test_connection
         ok, err = test_connection(uri)
     except Exception as e:
         ok, err = False, str(e)
-
     if not ok:
         bot.edit_message_text(
             message.chat.id, status_msg.message_id,
@@ -656,8 +749,6 @@ def handle_mongo_uri(message: types.Message):
             parse_mode="HTML",
         )
         return
-
-    # Save config and switch
     db_config.switch_to_mongodb(uri)
     cs(uid)
     bot.edit_message_text(
@@ -665,7 +756,7 @@ def handle_mongo_uri(message: types.Message):
         text=(
             "✅ <b>MongoDB connected successfully!</b>\n\n"
             "Config saved. <b>Restart the admin bot</b> for full effect.\n\n"
-            "💡 Use <b>🔁 Migrate data now</b> in the Switch Database menu to copy your existing data to MongoDB."
+            "💡 Use <b>🔁 Migrate data now</b> in Switch Database menu to copy data to MongoDB."
         ),
         parse_mode="HTML",
     )
@@ -678,11 +769,7 @@ def cb_switch_to_sqlite(call: types.CallbackQuery):
     db_config.switch_to_sqlite()
     bot.edit_message_text(
         call.message.chat.id, call.message.message_id,
-        text=(
-            "✅ <b>Switched to SQLite (local).</b>\n\n"
-            "Restart the admin bot to apply the change.\n"
-            "Your local database files are preserved."
-        ),
+        text="✅ <b>Switched to SQLite (local).</b>\n\nRestart the admin bot to apply.",
         parse_mode="HTML",
     )
 
@@ -690,11 +777,9 @@ def cb_switch_to_sqlite(call: types.CallbackQuery):
 @bot.callback_query_handler(func=lambda c: c.data == "migrate_data")
 @require_owner_cb
 def cb_migrate_data(call: types.CallbackQuery):
-    current_type = db_config.get_db_type()
-    if current_type != "mongodb":
-        bot.answer_callback_query(call.id, "⚠️ Switch to MongoDB first, then migrate.", show_alert=True)
+    if db_config.get_db_type() != "mongodb":
+        bot.answer_callback_query(call.id, "⚠️ Switch to MongoDB first.", show_alert=True)
         return
-
     bot.answer_callback_query(call.id, "⏳ Migrating...")
     status_msg = bot.send_message(call.message.chat.id, "⏳ <b>Migrating SQLite → MongoDB...</b>")
     try:
@@ -703,8 +788,7 @@ def cb_migrate_data(call: types.CallbackQuery):
         summary = "\n".join(f"• {k}: {v}" for k, v in counts.items())
         bot.edit_message_text(
             call.message.chat.id, status_msg.message_id,
-            text=f"✅ <b>Migration Complete!</b>\n\n{summary}",
-            parse_mode="HTML",
+            text=f"✅ <b>Migration Complete!</b>\n\n{summary}", parse_mode="HTML",
         )
     except Exception as e:
         bot.edit_message_text(
@@ -722,7 +806,6 @@ def menu_server_status(message: types.Message):
     db_type = info["type"]
     lines = ["📡 <b>Server & Database Status</b>\n"]
 
-    # DB status
     if db_type == "sqlite":
         data_dir = db.DATA_DIR
         db_files = list(data_dir.glob("*.db")) if data_dir.exists() else []
@@ -737,30 +820,19 @@ def menu_server_status(message: types.Message):
         try:
             from shared.mongo_db import test_connection
             ok, err = test_connection(uri)
-            if ok:
-                lines.append(f"✅ Status: Connected")
-            else:
-                lines.append(f"❌ Status: Error — {err[:80]}")
+            lines.append(f"✅ Status: Connected" if ok else f"❌ Status: Error — {err[:80]}")
         except Exception as e:
             lines.append(f"❌ Status: {e}")
 
     lines.append("")
-
-    # Child bot status
     bots = db.list_child_bots()
     running = sum(1 for b in bots if b["is_running"])
-    stopped = len(bots) - running
-
     lines.append(f"🤖 <b>Child Bots:</b> {len(bots)} total")
-    lines.append(f"   🟢 Running: {running}  |  🔴 Stopped: {stopped}")
-    if bots:
-        for b in bots:
-            icon = "🟢" if b["is_running"] else "🔴"
-            lines.append(f"   {icon} @{b['bot_username']}")
-
+    lines.append(f"   🟢 Running: {running}  |  🔴 Stopped: {len(bots) - running}")
+    for b in bots:
+        icon = "🟢" if b["is_running"] else "🔴"
+        lines.append(f"   {icon} @{b['bot_username']}")
     lines.append("")
-
-    # Process check
     alive = [bid for bid, proc in child_processes.items() if proc.poll() is None]
     lines.append(f"⚙️ <b>Active processes:</b> {len(alive)}")
 
