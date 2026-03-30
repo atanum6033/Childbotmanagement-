@@ -1,8 +1,11 @@
 """
 Child Bot — User-facing bot with full admin panel.
-Uses active_db which auto-selects SQLite or MongoDB based on config.
+New features:
+  - Upload User Data (JSON import from old bot exports)
+  - Request Admin requires code "123456" before sending
 """
 
+import json
 import os
 import sys
 import logging
@@ -34,6 +37,9 @@ logger = logging.getLogger(__name__)
 CHILD_TOKEN = os.environ.get("CHILD_BOT_TOKEN", "")
 CHILD_USERNAME = os.environ.get("CHILD_BOT_USERNAME", "")
 ADMIN_OWNER_ID = int(os.environ.get("ADMIN_BOT_OWNER_ID", "0"))
+
+# Code users must enter to request admin access
+ADMIN_REQUEST_CODE = "123456"
 
 if not CHILD_TOKEN:
     raise RuntimeError("CHILD_BOT_TOKEN is required")
@@ -82,7 +88,10 @@ def get_menu(uid: int) -> types.ReplyKeyboardMarkup:
 
 
 def register(message: types.Message) -> bool:
-    return db.upsert_user(DB_PATH, message.from_user.id, message.from_user.username, _full_name(message.from_user))
+    return db.upsert_user(
+        DB_PATH, message.from_user.id,
+        message.from_user.username, _full_name(message.from_user)
+    )
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
@@ -97,16 +106,15 @@ def cmd_start(message: types.Message):
         bot.send_message(message.chat.id, "🚫 You are blocked from this bot.")
         return
 
-    # Admin deep link
     args = message.text.split()
     if len(args) > 1 and args[1] == "adminpanel" and _is_admin(uid):
         bot.send_message(message.chat.id, "🎛 <b>Admin Panel</b>\n\nWelcome back!", reply_markup=child_admin_menu())
         return
 
-    # Always send start message first
+    # Always deliver start message first
     _deliver_start_message(message.chat.id, uid)
 
-    # Then — if mandatory channels exist — also send the join prompt
+    # Then show channel join prompt if mandatory channels exist
     mandatory = db.get_mandatory_channels(DB_PATH)
     if mandatory:
         all_channels = db.list_channels(DB_PATH)
@@ -119,18 +127,17 @@ def cmd_start(message: types.Message):
 
 
 def _deliver_start_message(chat_id: int, uid: int):
-    """Send the configured start message. Always called on /start."""
+    """Copy the saved start message or send a default welcome."""
     start_data = db.get_setting(DB_PATH, "start_message")
     if start_data and isinstance(start_data, dict):
         src_chat = start_data.get("source_chat_id")
         src_msg = start_data.get("source_message_id")
         if src_chat and src_msg:
             try:
-                # copy_message preserves ALL formatting, links, inline keyboards, entities
                 bot.copy_message(chat_id, src_chat, src_msg, reply_markup=get_menu(uid))
                 return
             except Exception as e:
-                logger.warning(f"copy_message failed ({e}), using fallback.")
+                logger.warning(f"copy_message failed: {e}")
     bot.send_message(
         chat_id,
         "👋 <b>Welcome!</b>\n\nThis bot is ready to use.",
@@ -144,7 +151,6 @@ def cb_check_join(call: types.CallbackQuery):
     mandatory = db.get_mandatory_channels(DB_PATH)
 
     if not mandatory:
-        # No mandatory channels — always pass verify
         bot.answer_callback_query(call.id, "✅ Verified!")
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -152,7 +158,6 @@ def cb_check_join(call: types.CallbackQuery):
             pass
         return
 
-    # Check join status — bot must be channel admin for this to work
     not_joined = []
     for ch in mandatory:
         cid = ch["channel_id"]
@@ -161,15 +166,11 @@ def cb_check_join(call: types.CallbackQuery):
             if member.status in ("left", "kicked", "banned"):
                 not_joined.append(ch["title"] or cid)
         except Exception as e:
-            # If bot is not admin, can't check — let through (log warning)
             logger.warning(f"Cannot check membership for {cid}: {e}")
 
     if not_joined:
-        titles = ", ".join(not_joined)
         bot.answer_callback_query(
-            call.id,
-            f"⚠️ Please join first: {titles}",
-            show_alert=True,
+            call.id, f"⚠️ Please join first: {', '.join(not_joined)}", show_alert=True,
         )
         return
 
@@ -207,11 +208,9 @@ def handle_send_to_admin(message: types.Message):
         cs(uid)
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=get_menu(uid))
         return
-
     u = db.get_user(DB_PATH, uid)
     uname = f"@{message.from_user.username}" if message.from_user.username else "No username"
     joined = ts_to_human(u["joined_at"]) if u else "Unknown"
-
     header = (
         f"📨 <b>User Message</b>\n"
         f"👤 {_full_name(message.from_user)} ({uname})\n"
@@ -225,7 +224,6 @@ def handle_send_to_admin(message: types.Message):
             bot.forward_message(aid, message.chat.id, message.message_id)
         except Exception as e:
             logger.warning(f"Forward to admin {aid}: {e}")
-
     cs(uid)
     bot.send_message(message.chat.id, "✅ <b>Message sent!</b>\n\nWait for admin reply.", reply_markup=get_menu(uid))
 
@@ -280,7 +278,7 @@ def menu_join(message: types.Message):
     bot.send_message(message.chat.id, "📢 <b>Our Channels:</b>", reply_markup=join_channels_inline(channels))
 
 
-# ─── User: Request Admin ──────────────────────────────────────────────────────
+# ─── User: Request Admin (with code) ─────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == "🙋 Request Admin")
 def menu_request_admin(message: types.Message):
@@ -288,10 +286,51 @@ def menu_request_admin(message: types.Message):
     if _is_admin(uid):
         bot.send_message(message.chat.id, "ℹ️ You are already an admin.", reply_markup=child_admin_menu())
         return
+    # Ask for the access code first
+    ss(uid, action="admin_request_code")
+    bot.send_message(
+        message.chat.id,
+        "🔐 <b>Admin Access Request</b>\n\n"
+        "Enter the <b>admin access code</b> to submit your request:",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@bot.message_handler(
+    content_types=["text"],
+    func=lambda m: gs(m.from_user.id).get("action") == "admin_request_code",
+)
+def handle_admin_request_code(message: types.Message):
+    uid = message.from_user.id
+    if message.text == "❌ Cancel":
+        cs(uid)
+        bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=child_main_menu())
+        return
+
+    entered_code = message.text.strip()
+    # Allow admin to configure the code via settings, default is ADMIN_REQUEST_CODE
+    configured_code = db.get_setting(DB_PATH, "admin_request_code") or ADMIN_REQUEST_CODE
+
+    if entered_code != str(configured_code):
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Wrong code.</b>\n\nContact an admin to get the access code.",
+            reply_markup=child_main_menu(),
+        )
+        cs(uid)
+        return
+
+    # Code is correct — send request
+    cs(uid)
     ok = db.request_admin_access(DB_PATH, uid, message.from_user.username, _full_name(message.from_user))
     if not ok:
-        bot.send_message(message.chat.id, "ℹ️ Your request is already pending. Please wait.", reply_markup=child_main_menu())
+        bot.send_message(
+            message.chat.id,
+            "ℹ️ Your admin request is already pending. Please wait for approval.",
+            reply_markup=child_main_menu(),
+        )
         return
+
     uname = f"@{message.from_user.username}" if message.from_user.username else "No username"
     for aid in db.get_admin_ids():
         try:
@@ -304,7 +343,11 @@ def menu_request_admin(message: types.Message):
             )
         except Exception:
             pass
-    bot.send_message(message.chat.id, "✅ <b>Request sent!</b>\n\nWait for admin approval.", reply_markup=child_main_menu())
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Request sent!</b>\n\nAn admin will review your request shortly.",
+        reply_markup=child_main_menu(),
+    )
 
 
 # ─── Admin: Set Start Message ─────────────────────────────────────────────────
@@ -317,8 +360,7 @@ def menu_set_start(message: types.Message):
         message.chat.id,
         "📝 <b>Set Start Message</b>\n\n"
         "Send any message — text, photo, video, sticker, or <b>forward from anywhere</b>.\n\n"
-        "✅ All formatting, inline links, and buttons are <b>fully preserved</b>.\n"
-        "The exact message will be copied to each user.",
+        "✅ All formatting, inline links, and buttons are <b>fully preserved</b>.",
         reply_markup=cancel_keyboard(),
     )
 
@@ -334,9 +376,6 @@ def handle_set_start_msg(message: types.Message):
         cs(uid)
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=child_admin_menu())
         return
-
-    # Store ONLY source_chat_id + source_message_id
-    # bot.copy_message() will reproduce the exact message with all links/formatting
     msg_data = {
         "source_chat_id": message.chat.id,
         "source_message_id": message.message_id,
@@ -346,8 +385,7 @@ def handle_set_start_msg(message: types.Message):
     cs(uid)
     bot.send_message(
         message.chat.id,
-        "✅ <b>Start message saved!</b>\n\n"
-        "All links, formatting, and media are preserved exactly.",
+        "✅ <b>Start message saved!</b>\n\nAll links, formatting, and media preserved.",
         reply_markup=child_admin_menu(),
     )
 
@@ -360,8 +398,7 @@ def menu_broadcast(message: types.Message):
     ss(message.from_user.id, action="broadcast_msg")
     bot.send_message(
         message.chat.id,
-        "📢 <b>Broadcast Message</b>\n\n"
-        "Send the message to broadcast (any type — forward works too):",
+        "📢 <b>Broadcast Message</b>\n\nSend the message to broadcast:",
         reply_markup=cancel_keyboard(),
     )
 
@@ -377,7 +414,6 @@ def handle_broadcast_preview(message: types.Message):
         cs(uid)
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=child_admin_menu())
         return
-
     ss(uid, action="broadcast_delay", bc_chat_id=message.chat.id, bc_msg_id=message.message_id)
     bot.send_message(message.chat.id, "👀 <b>Broadcast Preview:</b>")
     try:
@@ -388,7 +424,7 @@ def handle_broadcast_preview(message: types.Message):
     bot.send_message(
         message.chat.id,
         f"📊 Will send to <b>{counts['active']}</b> active users.\n\n"
-        "⏱ Delay between sends (seconds)? Send <code>0</code> for none, or e.g. <code>1</code>:",
+        "⏱ Delay between sends (seconds)? Send <code>0</code> for none:",
         reply_markup=cancel_keyboard(),
     )
 
@@ -406,10 +442,11 @@ def handle_broadcast_delay(message: types.Message):
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=child_admin_menu())
         return
     txt = message.text.strip().replace(",", ".")
+    delay = 0.0
     try:
-        delay = float(txt) if txt.replace(".", "", 1).isdigit() else 0
+        delay = float(txt)
     except Exception:
-        delay = 0
+        pass
     ss(uid, action="broadcast_dead", bc_chat_id=state["bc_chat_id"], bc_msg_id=state["bc_msg_id"], bc_delay=delay)
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -417,8 +454,7 @@ def handle_broadcast_delay(message: types.Message):
         types.InlineKeyboardButton("❌ Active only", callback_data="bc_dead:no"),
     )
     bot.send_message(
-        message.chat.id,
-        f"⏱ Delay: <b>{delay}s</b>\n\n🧟 Also send to inactive/dead users?",
+        message.chat.id, f"⏱ Delay: <b>{delay}s</b>\n\n🧟 Also send to inactive/dead users?",
         reply_markup=kb,
     )
 
@@ -441,11 +477,7 @@ def cb_broadcast_dead(call: types.CallbackQuery):
 
 
 def _run_broadcast(chat_id: int, src_msg_id: int, src_chat_id: int, delay: float, include_dead: bool):
-    if include_dead:
-        users = db.get_non_blocked_users(DB_PATH)  # All users not blocked (includes inactive)
-    else:
-        users = db.get_active_users(DB_PATH)
-
+    users = db.get_non_blocked_users(DB_PATH) if include_dead else db.get_active_users(DB_PATH)
     total = len(users)
     success = failed = blocked_count = 0
     status_msg = bot.send_message(chat_id, f"📤 Sending to {total} users...")
@@ -553,11 +585,10 @@ def _show_channel_manage(chat_id: int, msg_id: int = None):
     channels = db.list_channels(DB_PATH)
     text = (
         "🔗 <b>Channel Management</b>\n\n"
-        "📢 <b>🔴 Mandatory</b> — bot checks user has joined before granting access.\n"
-        "   (Bot must be an <b>admin</b> in the channel to verify membership.)\n\n"
-        "🔔 <b>🟢 Optional</b> — shown but not required. Verify always passes.\n\n"
-        "Click a channel row to toggle Mandatory/Optional.\n"
-        "Click 🗑 Remove to delete it."
+        "🔴 <b>Mandatory</b> — bot checks membership before access.\n"
+        "   (Bot must be <b>admin</b> in the channel to verify.)\n\n"
+        "🟢 <b>Optional</b> — shown but not required.\n\n"
+        "Click row to toggle. Click 🗑 to remove."
     )
     kb = channel_manage_inline(channels)
     if msg_id:
@@ -578,8 +609,7 @@ def cb_add_channel(call: types.CallbackQuery):
         call.message.chat.id,
         "➕ <b>Add Channel</b>\n\n"
         "Format: <code>Title | https://t.me/username</code>\n\n"
-        "Example: <code>My Channel | https://t.me/mychannel</code>\n\n"
-        "💡 To verify membership, add this bot as <b>Admin</b> in the channel.",
+        "💡 Add bot as <b>Admin</b> in channel to verify memberships.",
         reply_markup=cancel_keyboard(),
     )
 
@@ -606,9 +636,8 @@ def handle_add_channel(message: types.Message):
         cs(uid)
         bot.send_message(
             message.chat.id,
-            f"✅ Channel <b>{title}</b> added!\n\n"
-            "Default: <b>Mandatory</b>. Toggle in <b>🔗 Channel Links</b>.\n"
-            "⚠️ Make this bot an admin in the channel to verify memberships.",
+            f"✅ Channel <b>{title}</b> added! Default: <b>Mandatory</b>.\n"
+            "⚠️ Make this bot admin in the channel to verify memberships.",
             reply_markup=child_admin_menu(),
         )
     else:
@@ -706,7 +735,7 @@ def cb_remove_cadmin(call: types.CallbackQuery):
         bot.answer_callback_query(call.id, "Not found.")
 
 
-# ─── Admin: Requests ─────────────────────────────────────────────────────────
+# ─── Admin: Admin Requests ────────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == "📬 Admin Requests")
 @require_admin
@@ -763,6 +792,116 @@ def cb_deny_req(call: types.CallbackQuery):
         pass
 
 
+# ─── Admin: 📤 Upload User Data ───────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "📤 Upload User Data")
+@require_admin
+def menu_upload_users(message: types.Message):
+    ss(message.from_user.id, action="upload_users")
+    bot.send_message(
+        message.chat.id,
+        "📤 <b>Upload Old Bot User Data</b>\n\n"
+        "Send a <b>JSON file</b> containing user data.\n\n"
+        "Supported formats:\n"
+        "• <code>{\"users\": [{\"id\": ..., \"username\": ..., \"full_name\": ..., \"joined\": ...}]}</code>\n"
+        "• Array: <code>[{\"id\": ..., ...}]</code>\n\n"
+        "Duplicate users (same ID) will be skipped.\n"
+        "New users are added with their original join date.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@bot.message_handler(
+    content_types=["document"],
+    func=lambda m: gs(m.from_user.id).get("action") == "upload_users",
+)
+@require_admin
+def handle_upload_users(message: types.Message):
+    uid = message.from_user.id
+    doc = message.document
+
+    if not (doc.file_name.endswith(".json") or doc.mime_type == "application/json"):
+        bot.reply_to(message, "⚠️ Please send a <b>.json</b> file.")
+        return
+
+    status_msg = bot.send_message(message.chat.id, "⏳ Reading file and importing users...")
+
+    try:
+        raw = bot.download_file(bot.get_file(doc.file_id).file_path)
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        bot.edit_message_text(
+            message.chat.id, status_msg.message_id,
+            text=f"❌ <b>Failed to read file:</b> {e}", parse_mode="HTML",
+        )
+        cs(uid)
+        return
+
+    # Support both {"users": [...]} and plain [...]
+    if isinstance(data, dict):
+        users_list = data.get("users") or data.get("data") or []
+    elif isinstance(data, list):
+        users_list = data
+    else:
+        bot.edit_message_text(
+            message.chat.id, status_msg.message_id,
+            text="❌ <b>Invalid format.</b> Expected a JSON object with a \"users\" array or a JSON array.",
+            parse_mode="HTML",
+        )
+        cs(uid)
+        return
+
+    if not users_list:
+        bot.edit_message_text(
+            message.chat.id, status_msg.message_id,
+            text="⚠️ No users found in the file.", parse_mode="HTML",
+        )
+        cs(uid)
+        return
+
+    # Import users
+    try:
+        result = db.import_users_from_list(DB_PATH, users_list)
+    except Exception as e:
+        bot.edit_message_text(
+            message.chat.id, status_msg.message_id,
+            text=f"❌ Import error: {e}", parse_mode="HTML",
+        )
+        cs(uid)
+        return
+
+    # Get updated counts
+    updated_counts = db.count_users(DB_PATH)
+
+    cs(uid)
+    bot.edit_message_text(
+        message.chat.id, status_msg.message_id,
+        text=(
+            f"✅ <b>User Import Complete!</b>\n\n"
+            f"📋 File contained: <b>{len(users_list)}</b> users\n\n"
+            f"✅ <b>Added:</b> {result['success']}\n"
+            f"⏭ <b>Skipped</b> (already exist): {result['skipped']}\n"
+            f"❌ <b>Failed:</b> {result['failed']}\n\n"
+            f"📊 <b>Database now has:</b>\n"
+            f"   👥 Total: {updated_counts['total']}\n"
+            f"   ✅ Active: {updated_counts['active']}"
+        ),
+        parse_mode="HTML",
+        reply_markup=child_admin_menu(),
+    )
+    bot.send_message(message.chat.id, "Import done.", reply_markup=child_admin_menu())
+
+
+# Cancel while in upload state (text message)
+@bot.message_handler(
+    content_types=["text"],
+    func=lambda m: gs(m.from_user.id).get("action") == "upload_users" and m.text == "❌ Cancel",
+)
+def handle_upload_cancel(message: types.Message):
+    cs(message.from_user.id)
+    bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=child_admin_menu())
+
+
 # ─── Admin: Back to User Menu ─────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == "🔙 Back to User Menu")
@@ -787,13 +926,13 @@ def handle_cancel(message: types.Message):
 def cb_noop(call): bot.answer_callback_query(call.id)
 
 
-# ─── Fallback: forward any message to admins ─────────────────────────────────
+# ─── Fallback ────────────────────────────────────────────────────────────────
 
 _skip_texts = {
     "📨 Message Admin", "🔗 Join Channel", "🙋 Request Admin", "❌ Cancel",
     "📝 Set Start Message", "📢 Broadcast", "👥 Total Users",
     "🚫 Block/Unblock User", "🔗 Channel Links", "👮 Manage Admins",
-    "📬 Admin Requests", "🔙 Back to User Menu",
+    "📬 Admin Requests", "📤 Upload User Data", "🔙 Back to User Menu",
 }
 
 
