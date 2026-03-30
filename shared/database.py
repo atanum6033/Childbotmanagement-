@@ -7,6 +7,7 @@ import sqlite3
 import json
 import logging
 import time
+import datetime as _dt
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional, Any
@@ -58,7 +59,6 @@ def init_admin_db():
                 is_owner    INTEGER NOT NULL DEFAULT 0,
                 added_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
-
             CREATE TABLE IF NOT EXISTS child_bots (
                 id           INTEGER PRIMARY KEY,
                 bot_token    TEXT NOT NULL UNIQUE,
@@ -68,7 +68,6 @@ def init_admin_db():
                 added_by     INTEGER NOT NULL,
                 added_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
-
             CREATE INDEX IF NOT EXISTS idx_child_bots_username ON child_bots(bot_username);
             CREATE INDEX IF NOT EXISTS idx_admins_user_id ON admins(user_id);
         """)
@@ -83,18 +82,16 @@ def init_child_db(db_path: Path):
                 id          INTEGER PRIMARY KEY,
                 user_id     INTEGER NOT NULL UNIQUE,
                 username    TEXT,
-                full_name   TEXT NOT NULL,
+                full_name   TEXT NOT NULL DEFAULT 'Unknown',
                 is_active   INTEGER NOT NULL DEFAULT 1,
                 is_blocked  INTEGER NOT NULL DEFAULT 0,
                 joined_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 last_seen   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
-
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key     TEXT PRIMARY KEY,
                 value   TEXT
             );
-
             CREATE TABLE IF NOT EXISTS channels (
                 id           INTEGER PRIMARY KEY,
                 channel_id   TEXT NOT NULL UNIQUE,
@@ -103,7 +100,6 @@ def init_child_db(db_path: Path):
                 is_mandatory INTEGER NOT NULL DEFAULT 1,
                 added_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
-
             CREATE TABLE IF NOT EXISTS broadcast_log (
                 id       INTEGER PRIMARY KEY,
                 sent_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
@@ -112,24 +108,21 @@ def init_child_db(db_path: Path):
                 failed   INTEGER NOT NULL DEFAULT 0,
                 blocked  INTEGER NOT NULL DEFAULT 0
             );
-
             CREATE TABLE IF NOT EXISTS child_admins (
-                id       INTEGER PRIMARY KEY,
-                user_id  INTEGER NOT NULL UNIQUE,
-                username TEXT,
-                full_name TEXT NOT NULL,
-                added_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                id        INTEGER PRIMARY KEY,
+                user_id   INTEGER NOT NULL UNIQUE,
+                username  TEXT,
+                full_name TEXT NOT NULL DEFAULT 'Unknown',
+                added_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
-
             CREATE TABLE IF NOT EXISTS admin_requests (
-                id          INTEGER PRIMARY KEY,
-                user_id     INTEGER NOT NULL UNIQUE,
-                username    TEXT,
-                full_name   TEXT NOT NULL,
+                id           INTEGER PRIMARY KEY,
+                user_id      INTEGER NOT NULL UNIQUE,
+                username     TEXT,
+                full_name    TEXT NOT NULL DEFAULT 'Unknown',
                 requested_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                status      TEXT NOT NULL DEFAULT 'pending'
+                status       TEXT NOT NULL DEFAULT 'pending'
             );
-
             CREATE INDEX IF NOT EXISTS idx_bot_users_uid ON bot_users(user_id);
             CREATE INDEX IF NOT EXISTS idx_bot_users_active ON bot_users(is_active, is_blocked);
             CREATE INDEX IF NOT EXISTS idx_child_admins_uid ON child_admins(user_id);
@@ -146,7 +139,9 @@ def is_admin(user_id: int) -> bool:
 
 def is_owner(user_id: int) -> bool:
     with get_conn() as conn:
-        return conn.execute("SELECT 1 FROM admins WHERE user_id=? AND is_owner=1", (user_id,)).fetchone() is not None
+        return conn.execute(
+            "SELECT 1 FROM admins WHERE user_id=? AND is_owner=1", (user_id,)
+        ).fetchone() is not None
 
 
 def add_admin(user_id: int, username: Optional[str], full_name: str, is_owner_flag: bool = False):
@@ -226,7 +221,8 @@ def upsert_user(db_path: Path, user_id: int, username: Optional[str], full_name:
         existing = conn.execute("SELECT id FROM bot_users WHERE user_id=?", (user_id,)).fetchone()
         if existing:
             conn.execute(
-                "UPDATE bot_users SET username=?, full_name=?, last_seen=strftime('%s','now'), is_active=1 WHERE user_id=?",
+                "UPDATE bot_users SET username=?, full_name=?, last_seen=strftime('%s','now'), is_active=1 "
+                "WHERE user_id=?",
                 (username, full_name, user_id)
             )
             return False
@@ -254,8 +250,8 @@ def set_user_inactive(db_path: Path, user_id: int):
 
 def count_users(db_path: Path) -> dict:
     with get_conn(db_path) as conn:
-        total = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
-        active = conn.execute("SELECT COUNT(*) FROM bot_users WHERE is_active=1 AND is_blocked=0").fetchone()[0]
+        total   = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
+        active  = conn.execute("SELECT COUNT(*) FROM bot_users WHERE is_active=1 AND is_blocked=0").fetchone()[0]
         inactive = conn.execute("SELECT COUNT(*) FROM bot_users WHERE is_active=0").fetchone()[0]
         blocked = conn.execute("SELECT COUNT(*) FROM bot_users WHERE is_blocked=1").fetchone()[0]
     return {"total": total, "active": active, "inactive": inactive, "blocked": blocked}
@@ -287,7 +283,7 @@ def get_all_users_paginated(db_path: Path, page: int = 1, per_page: int = 10) ->
 
 
 def get_all_users_export(db_path: Path) -> list:
-    """Return all users with all fields for CSV export."""
+    """All users with full fields for CSV export, ordered by join date."""
     with get_conn(db_path) as conn:
         return conn.execute(
             "SELECT user_id, username, full_name, is_active, is_blocked, joined_at, last_seen "
@@ -297,60 +293,71 @@ def get_all_users_export(db_path: Path) -> list:
 
 def import_users_from_list(db_path: Path, users: list) -> dict:
     """
-    Import users from a list of dicts (from JSON export format).
-    Each dict can have: id/user_id, username, full_name, joined (datetime string).
-    Returns: {success, failed, skipped}
+    Import users from a list of dicts (JSON export format).
+    Supports fields: id / user_id, username, full_name / name, joined / joined_at.
+    Uses INSERT OR IGNORE so duplicate user_ids are safely skipped.
+    Returns: {"success": int, "skipped": int, "failed": int}
     """
-    import datetime as _dt
     success = 0
-    failed = 0
+    failed  = 0
     skipped = 0
 
-    def parse_ts(joined_str) -> int:
-        if not joined_str:
+    def _parse_ts(val) -> int:
+        """Parse a datetime string or return current time."""
+        if not val:
             return int(time.time())
+        s = str(val)[:26]
         for fmt in (
             "%Y-%m-%dT%H:%M:%S.%f",
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%d %H:%M:%S.%f",
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
         ):
             try:
-                return int(_dt.datetime.strptime(str(joined_str)[:26], fmt).timestamp())
+                return int(_dt.datetime.strptime(s, fmt).timestamp())
             except ValueError:
                 continue
         return int(time.time())
 
+    # Use one connection for the whole batch — INSERT OR IGNORE avoids
+    # transaction-aborting constraint violations.
     with get_conn(db_path) as conn:
         for u in users:
             try:
-                uid = int(u.get("id") or u.get("user_id") or 0)
+                # Accept both "id" (old format) and "user_id"
+                uid = u.get("id") or u.get("user_id")
                 if not uid:
                     failed += 1
                     continue
-                username = u.get("username")
-                full_name = u.get("full_name") or u.get("name") or "Unknown"
-                joined_ts = parse_ts(u.get("joined") or u.get("joined_at"))
-
-                existing = conn.execute(
-                    "SELECT id FROM bot_users WHERE user_id=?", (uid,)
-                ).fetchone()
-                if existing:
-                    skipped += 1
+                uid = int(uid)
+                if uid <= 0:
+                    failed += 1
                     continue
 
-                conn.execute(
-                    "INSERT INTO bot_users (user_id, username, full_name, joined_at, last_seen) "
-                    "VALUES (?,?,?,?,?)",
+                username  = u.get("username") or None
+                full_name = (u.get("full_name") or u.get("name") or "").strip() or "Unknown"
+                joined_ts = _parse_ts(u.get("joined") or u.get("joined_at"))
+
+                # INSERT OR IGNORE — safe: no exception on duplicate user_id
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO bot_users "
+                    "(user_id, username, full_name, is_active, is_blocked, joined_at, last_seen) "
+                    "VALUES (?,?,?,1,0,?,?)",
                     (uid, username, full_name, joined_ts, joined_ts)
                 )
-                success += 1
+                if cur.rowcount > 0:
+                    success += 1
+                else:
+                    skipped += 1      # user_id already exists
+
             except Exception as e:
-                logger.warning(f"Import user error: {e}")
+                logger.warning(f"import_users row error: {e} | row={u}")
                 failed += 1
 
-    return {"success": success, "failed": failed, "skipped": skipped}
+    logger.info(f"import_users_from_list: success={success} skipped={skipped} failed={failed}")
+    return {"success": success, "skipped": skipped, "failed": failed}
 
 
 # ─── Settings helpers ────────────────────────────────────────────────────────
@@ -412,7 +419,9 @@ def list_channels(db_path: Path) -> list:
 
 def get_mandatory_channels(db_path: Path) -> list:
     with get_conn(db_path) as conn:
-        return conn.execute("SELECT * FROM channels WHERE is_mandatory=1 ORDER BY added_at ASC").fetchall()
+        return conn.execute(
+            "SELECT * FROM channels WHERE is_mandatory=1 ORDER BY added_at ASC"
+        ).fetchall()
 
 
 # ─── Broadcast log ───────────────────────────────────────────────────────────
@@ -431,7 +440,9 @@ def is_child_admin(db_path: Path, user_id: int) -> bool:
     if is_admin(user_id):
         return True
     with get_conn(db_path) as conn:
-        return conn.execute("SELECT 1 FROM child_admins WHERE user_id=?", (user_id,)).fetchone() is not None
+        return conn.execute(
+            "SELECT 1 FROM child_admins WHERE user_id=?", (user_id,)
+        ).fetchone() is not None
 
 
 def add_child_admin(db_path: Path, user_id: int, username: Optional[str], full_name: str) -> bool:
@@ -469,8 +480,8 @@ def request_admin_access(db_path: Path, user_id: int, username: Optional[str], f
                 if existing["status"] == "pending":
                     return False
                 conn.execute(
-                    "UPDATE admin_requests SET status='pending', requested_at=strftime('%s','now') WHERE user_id=?",
-                    (user_id,)
+                    "UPDATE admin_requests SET status='pending', requested_at=strftime('%s','now') "
+                    "WHERE user_id=?", (user_id,)
                 )
             else:
                 conn.execute(

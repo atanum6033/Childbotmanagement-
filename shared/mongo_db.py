@@ -262,25 +262,24 @@ def get_all_users_export(db_path: Path) -> list:
 
 
 def import_users_from_list(db_path: Path, users: list) -> dict:
-    """Import users from a list of dicts. Returns {success, failed, skipped}."""
+    """Import users from a list of dicts. Returns {success, skipped, failed}."""
     import datetime as _dt
     import time as _time
     success = 0
-    failed = 0
+    failed  = 0
     skipped = 0
 
-    def parse_ts(joined_str) -> int:
-        if not joined_str:
+    def _parse_ts(val) -> int:
+        if not val:
             return int(_time.time())
+        s = str(val)[:26]
         for fmt in (
-            "%Y-%m-%dT%H:%M:%S.%f",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%d %H:%M:%S.%f",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
+            "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M", "%Y-%m-%d",
         ):
             try:
-                return int(_dt.datetime.strptime(str(joined_str)[:26], fmt).timestamp())
+                return int(_dt.datetime.strptime(s, fmt).timestamp())
             except ValueError:
                 continue
         return int(_time.time())
@@ -288,33 +287,33 @@ def import_users_from_list(db_path: Path, users: list) -> dict:
     coll = _child_db(db_path)["bot_users"]
     for u in users:
         try:
-            uid = int(u.get("id") or u.get("user_id") or 0)
+            uid = u.get("id") or u.get("user_id")
             if not uid:
                 failed += 1
                 continue
-            username = u.get("username")
-            full_name = u.get("full_name") or u.get("name") or "Unknown"
-            joined_ts = parse_ts(u.get("joined") or u.get("joined_at"))
+            uid = int(uid)
+            if uid <= 0:
+                failed += 1
+                continue
+            username  = u.get("username") or None
+            full_name = (u.get("full_name") or u.get("name") or "").strip() or "Unknown"
+            joined_ts = _parse_ts(u.get("joined") or u.get("joined_at"))
 
             if coll.find_one({"user_id": uid}):
                 skipped += 1
                 continue
 
             coll.insert_one({
-                "user_id": uid,
-                "username": username,
-                "full_name": full_name,
-                "is_active": 1,
-                "is_blocked": 0,
-                "joined_at": joined_ts,
-                "last_seen": joined_ts,
+                "user_id": uid, "username": username, "full_name": full_name,
+                "is_active": 1, "is_blocked": 0,
+                "joined_at": joined_ts, "last_seen": joined_ts,
             })
             success += 1
         except Exception as e:
-            logger.warning(f"Import user error: {e}")
+            logger.warning(f"import_users row error: {e}")
             failed += 1
 
-    return {"success": success, "failed": failed, "skipped": skipped}
+    return {"success": success, "skipped": skipped, "failed": failed}
 
 
 def get_all_users_paginated(db_path: Path, page: int = 1, per_page: int = 10) -> tuple:
