@@ -8,14 +8,15 @@ Import this as `db` everywhere:
 
 from shared.db_config import get_db_type as _get_db_type
 
-_EXPORTS = [
+_SHARED_EXPORTS = [
     "get_db_path", "get_child_db_path", "DATA_DIR",
     "init_admin_db", "init_child_db",
     "is_admin", "is_owner", "add_admin", "remove_admin", "list_admins", "get_admin_ids",
     "add_child_bot", "remove_child_bot", "get_child_bot", "get_child_bot_by_token",
     "list_child_bots", "set_child_bot_running", "set_all_bots_stopped",
     "upsert_user", "get_user", "set_user_blocked", "set_user_inactive",
-    "count_users", "get_active_users", "get_non_blocked_users", "get_all_users_paginated",
+    "count_users", "get_active_users", "get_non_blocked_users",
+    "get_all_users_export", "import_users_from_list", "get_all_users_paginated",
     "get_setting", "set_setting",
     "add_channel", "remove_channel", "toggle_channel_mandatory",
     "list_channels", "get_mandatory_channels",
@@ -35,7 +36,8 @@ if _db_type == "mongodb":
             add_child_bot, remove_child_bot, get_child_bot, get_child_bot_by_token,
             list_child_bots, set_child_bot_running, set_all_bots_stopped,
             upsert_user, get_user, set_user_blocked, set_user_inactive,
-            count_users, get_active_users, get_non_blocked_users, get_all_users_paginated,
+            count_users, get_active_users, get_non_blocked_users,
+            get_all_users_export, import_users_from_list, get_all_users_paginated,
             get_setting, set_setting,
             add_channel, remove_channel, toggle_channel_mandatory,
             list_channels, get_mandatory_channels,
@@ -55,7 +57,8 @@ if _db_type == "mongodb":
             add_child_bot, remove_child_bot, get_child_bot, get_child_bot_by_token,
             list_child_bots, set_child_bot_running, set_all_bots_stopped,
             upsert_user, get_user, set_user_blocked, set_user_inactive,
-            count_users, get_active_users, get_non_blocked_users, get_all_users_paginated,
+            count_users, get_active_users, get_non_blocked_users,
+            get_all_users_export, import_users_from_list, get_all_users_paginated,
             get_setting, set_setting,
             add_channel, remove_channel, toggle_channel_mandatory,
             list_channels, get_mandatory_channels,
@@ -71,7 +74,8 @@ else:
         add_child_bot, remove_child_bot, get_child_bot, get_child_bot_by_token,
         list_child_bots, set_child_bot_running, set_all_bots_stopped,
         upsert_user, get_user, set_user_blocked, set_user_inactive,
-        count_users, get_active_users, get_non_blocked_users, get_all_users_paginated,
+        count_users, get_active_users, get_non_blocked_users,
+        get_all_users_export, import_users_from_list, get_all_users_paginated,
         get_setting, set_setting,
         add_channel, remove_channel, toggle_channel_mandatory,
         list_channels, get_mandatory_channels,

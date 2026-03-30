@@ -6,13 +6,13 @@ SQLite with WAL mode — fast, concurrent, duplicate-free.
 import sqlite3
 import json
 import logging
+import time
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional, Any
 
 logger = logging.getLogger(__name__)
 
-# All paths are absolute based on project root
 _PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = _PROJECT_ROOT / "data"
 
@@ -168,7 +168,7 @@ def list_admins() -> list:
         return conn.execute("SELECT * FROM admins ORDER BY added_at ASC").fetchall()
 
 
-def get_admin_ids() -> list[int]:
+def get_admin_ids() -> list:
     with get_conn() as conn:
         rows = conn.execute("SELECT user_id FROM admins").fetchall()
         return [r["user_id"] for r in rows]
@@ -269,7 +269,6 @@ def get_active_users(db_path: Path) -> list:
 
 
 def get_non_blocked_users(db_path: Path) -> list:
-    """Return all users who are not blocked (includes inactive). For broad broadcasts."""
     with get_conn(db_path) as conn:
         return conn.execute(
             "SELECT user_id FROM bot_users WHERE is_blocked=0"
@@ -285,6 +284,73 @@ def get_all_users_paginated(db_path: Path, page: int = 1, per_page: int = 10) ->
             (per_page, offset)
         ).fetchall()
     return rows, total
+
+
+def get_all_users_export(db_path: Path) -> list:
+    """Return all users with all fields for CSV export."""
+    with get_conn(db_path) as conn:
+        return conn.execute(
+            "SELECT user_id, username, full_name, is_active, is_blocked, joined_at, last_seen "
+            "FROM bot_users ORDER BY joined_at ASC"
+        ).fetchall()
+
+
+def import_users_from_list(db_path: Path, users: list) -> dict:
+    """
+    Import users from a list of dicts (from JSON export format).
+    Each dict can have: id/user_id, username, full_name, joined (datetime string).
+    Returns: {success, failed, skipped}
+    """
+    import datetime as _dt
+    success = 0
+    failed = 0
+    skipped = 0
+
+    def parse_ts(joined_str) -> int:
+        if not joined_str:
+            return int(time.time())
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+        ):
+            try:
+                return int(_dt.datetime.strptime(str(joined_str)[:26], fmt).timestamp())
+            except ValueError:
+                continue
+        return int(time.time())
+
+    with get_conn(db_path) as conn:
+        for u in users:
+            try:
+                uid = int(u.get("id") or u.get("user_id") or 0)
+                if not uid:
+                    failed += 1
+                    continue
+                username = u.get("username")
+                full_name = u.get("full_name") or u.get("name") or "Unknown"
+                joined_ts = parse_ts(u.get("joined") or u.get("joined_at"))
+
+                existing = conn.execute(
+                    "SELECT id FROM bot_users WHERE user_id=?", (uid,)
+                ).fetchone()
+                if existing:
+                    skipped += 1
+                    continue
+
+                conn.execute(
+                    "INSERT INTO bot_users (user_id, username, full_name, joined_at, last_seen) "
+                    "VALUES (?,?,?,?,?)",
+                    (uid, username, full_name, joined_ts, joined_ts)
+                )
+                success += 1
+            except Exception as e:
+                logger.warning(f"Import user error: {e}")
+                failed += 1
+
+    return {"success": success, "failed": failed, "skipped": skipped}
 
 
 # ─── Settings helpers ────────────────────────────────────────────────────────
@@ -362,7 +428,6 @@ def log_broadcast(db_path: Path, total: int, success: int, failed: int, blocked:
 # ─── Child bot admins ────────────────────────────────────────────────────────
 
 def is_child_admin(db_path: Path, user_id: int) -> bool:
-    # Check both global admin bot admins AND child-specific admins
     if is_admin(user_id):
         return True
     with get_conn(db_path) as conn:
@@ -402,7 +467,7 @@ def request_admin_access(db_path: Path, user_id: int, username: Optional[str], f
             ).fetchone()
             if existing:
                 if existing["status"] == "pending":
-                    return False  # already pending
+                    return False
                 conn.execute(
                     "UPDATE admin_requests SET status='pending', requested_at=strftime('%s','now') WHERE user_id=?",
                     (user_id,)

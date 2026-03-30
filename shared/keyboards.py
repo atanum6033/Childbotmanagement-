@@ -15,6 +15,7 @@ def admin_main_menu() -> types.ReplyKeyboardMarkup:
         types.KeyboardButton("📋 List Child Bots"),
         types.KeyboardButton("▶️ Stop/Run Bot"),
         types.KeyboardButton("📊 Total Users"),
+        types.KeyboardButton("📥 Download Users CSV"),
         types.KeyboardButton("💾 Backup Database"),
         types.KeyboardButton("♻️ Restore Database"),
         types.KeyboardButton("🎛 Use Child Bot Admin"),
@@ -103,6 +104,7 @@ def child_admin_menu() -> types.ReplyKeyboardMarkup:
         types.KeyboardButton("🔗 Channel Links"),
         types.KeyboardButton("👮 Manage Admins"),
         types.KeyboardButton("📬 Admin Requests"),
+        types.KeyboardButton("📤 Upload User Data"),
         types.KeyboardButton("🔙 Back to User Menu"),
     )
     return kb

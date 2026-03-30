@@ -253,6 +253,70 @@ def get_non_blocked_users(db_path: Path) -> list:
     ))
 
 
+def get_all_users_export(db_path: Path) -> list:
+    """Return all users with all fields for CSV export."""
+    return _to_rows(_child_db(db_path)["bot_users"].find(
+        {}, {"user_id": 1, "username": 1, "full_name": 1, "is_active": 1,
+              "is_blocked": 1, "joined_at": 1, "last_seen": 1}
+    ).sort("joined_at", 1))
+
+
+def import_users_from_list(db_path: Path, users: list) -> dict:
+    """Import users from a list of dicts. Returns {success, failed, skipped}."""
+    import datetime as _dt
+    import time as _time
+    success = 0
+    failed = 0
+    skipped = 0
+
+    def parse_ts(joined_str) -> int:
+        if not joined_str:
+            return int(_time.time())
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+        ):
+            try:
+                return int(_dt.datetime.strptime(str(joined_str)[:26], fmt).timestamp())
+            except ValueError:
+                continue
+        return int(_time.time())
+
+    coll = _child_db(db_path)["bot_users"]
+    for u in users:
+        try:
+            uid = int(u.get("id") or u.get("user_id") or 0)
+            if not uid:
+                failed += 1
+                continue
+            username = u.get("username")
+            full_name = u.get("full_name") or u.get("name") or "Unknown"
+            joined_ts = parse_ts(u.get("joined") or u.get("joined_at"))
+
+            if coll.find_one({"user_id": uid}):
+                skipped += 1
+                continue
+
+            coll.insert_one({
+                "user_id": uid,
+                "username": username,
+                "full_name": full_name,
+                "is_active": 1,
+                "is_blocked": 0,
+                "joined_at": joined_ts,
+                "last_seen": joined_ts,
+            })
+            success += 1
+        except Exception as e:
+            logger.warning(f"Import user error: {e}")
+            failed += 1
+
+    return {"success": success, "failed": failed, "skipped": skipped}
+
+
 def get_all_users_paginated(db_path: Path, page: int = 1, per_page: int = 10) -> tuple:
     coll = _child_db(db_path)["bot_users"]
     total = coll.count_documents({})
